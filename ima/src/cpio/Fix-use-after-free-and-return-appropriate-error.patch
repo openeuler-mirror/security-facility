@@ -1,0 +1,61 @@
+From 356ad51812edb47fd76aa59b8c935d55b879541a Mon Sep 17 00:00:00 2001
+From: Roberto Sassu <roberto.sassu@huawei.com>
+Date: Thu, 2 Jul 2020 10:23:44 +0200
+Subject: [PATCH] cpio: fix use after free and return appropriate errors
+
+---
+ src/copyout.c | 23 +++++++++++++++--------
+ 1 file changed, 15 insertions(+), 8 deletions(-)
+
+diff --git a/src/copyout.c b/src/copyout.c
+index 29d2198..7feed00 100644
+--- a/src/copyout.c
++++ b/src/copyout.c
+@@ -600,15 +600,19 @@ write_xattrs (int metadata_fd, char *path)
+   list_ptr = xattr_list = malloc(list_len);
+   if (!list_ptr) {
+     error (0, 0, _("out of memory"));
+-    return ret;
++    return -ENOMEM;
+   }
+ 
+   len = llistxattr(path, xattr_list, list_len);
+-  if (len != list_len)
++  if (len != list_len) {
++    ret = -EIO;
+     goto out;
++  }
+ 
+-  if (ftruncate(metadata_fd, 0))
++  if (ftruncate(metadata_fd, 0)) {
++    ret = -EIO;
+     goto out;
++  }
+ 
+   lseek(metadata_fd, 0, SEEK_SET);
+ 
+@@ -658,13 +662,16 @@ write_xattrs (int metadata_fd, char *path)
+   }
+ 
+   free(xattr_value);
+-out:
+-  free(xattr_list);
+ 
+-  if (list_ptr != xattr_list + list_len)
+-    return ret;
++  if (list_ptr != xattr_list + list_len) {
++    ret = -EINVAL;
++    goto out;
++  }
+ 
+-  return 0;
++  ret = 0;
++out:
++  free(xattr_list);
++  return ret;
+ }
+ 
+ /* Read a list of file names from the standard input
+-- 
+2.27.GIT
+

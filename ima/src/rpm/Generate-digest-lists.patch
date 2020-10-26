@@ -1,0 +1,323 @@
+From 4d1801825c754171962050ee9c36c2d69c630ece Mon Sep 17 00:00:00 2001
+From: Roberto Sassu <roberto.sassu@huawei.com>
+Date: Thu, 12 Mar 2020 17:29:55 +0100
+Subject: [PATCH 1/3] Generate digest lists
+
+---
+ build/files.c | 176 ++++++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 169 insertions(+), 7 deletions(-)
+
+diff --git a/build/files.c b/build/files.c
+index 6dfd801c8..ab6938d8c 100644
+--- a/build/files.c
++++ b/build/files.c
+@@ -50,6 +50,7 @@
+ #define DEBUG_LIB_PREFIX	"/usr/lib/debug/"
+ #define DEBUG_ID_DIR		"/usr/lib/debug/.build-id"
+ #define DEBUG_DWZ_DIR 		"/usr/lib/debug/.dwz"
++#define DIGEST_LIST_DIR		"/.digest_lists"
+ 
+ #undef HASHTYPE
+ #undef HTKEYTYPE
+@@ -129,6 +130,8 @@ typedef struct AttrRec_s {
+ 
+ /* list of files */
+ static StringBuf check_fileList = NULL;
++/* list of files per binary package */
++static StringBuf check_fileList_bin_pkg = NULL;
+ 
+ typedef struct FileEntry_s {
+     rpmfileAttrs attrFlags;
+@@ -193,6 +196,10 @@ typedef struct FileList_s {
+     struct FileEntry_s cur;
+ } * FileList;
+ 
++static char *digest_list_dir;
++
++static int genDigestList(Header header, FileList fl, StringBuf fileList);
++
+ static void nullAttrRec(AttrRec ar)
+ {
+     memset(ar, 0, sizeof(*ar));
+@@ -984,11 +991,13 @@ static void genCpioListAndHeader(FileList fl, Package pkg, int isSrc)
+ {
+     FileListRec flp;
+     char buf[BUFSIZ];
++    char file_info[BUFSIZ];
++    char file_digest[128 * 2 + 1];
+     int i, npaths = 0;
+     uint32_t defaultalgo = PGPHASHALGO_MD5, digestalgo;
+     rpm_loff_t totalFileSize = 0;
+     Header h = pkg->header; /* just a shortcut */
+-    int override_date = 0;
++    int override_date = 0, processed = 0;
+     time_t source_date_epoch;
+     char *srcdate = getenv("SOURCE_DATE_EPOCH");
+ 
+@@ -1058,8 +1067,9 @@ static void genCpioListAndHeader(FileList fl, Package pkg, int isSrc)
+     
+     pkg->dpaths = xmalloc((fl->files.used + 1) * sizeof(*pkg->dpaths));
+ 
++process_files:
+     /* Generate the header. */
+-    for (i = 0, flp = fl->files.recs; i < fl->files.used; i++, flp++) {
++    for (i = processed, flp = fl->files.recs + processed; i < fl->files.used; i++, flp++) {
+ 	rpm_ino_t fileid = flp - fl->files.recs;
+ 
+  	/* Merge duplicate entries. */
+@@ -1190,7 +1200,8 @@ static void genCpioListAndHeader(FileList fl, Package pkg, int isSrc)
+ 	    (void) rpmDoDigest(digestalgo, flp->diskPath, 1, 
+ 			       (unsigned char *)buf);
+ 	headerPutString(h, RPMTAG_FILEDIGESTS, buf);
+-	
++	snprintf(file_digest, sizeof(file_digest), "%s", buf);
++
+ 	buf[0] = '\0';
+ 	if (S_ISLNK(flp->fl_mode)) {
+ 	    ssize_t llen = readlink(flp->diskPath, buf, BUFSIZ-1);
+@@ -1230,7 +1241,33 @@ static void genCpioListAndHeader(FileList fl, Package pkg, int isSrc)
+ 	flp->flags &= PARSEATTR_MASK;
+ 
+ 	headerPutUint32(h, RPMTAG_FILEFLAGS, &(flp->flags) ,1);
++
++	if (!processed && check_fileList_bin_pkg && S_ISREG(flp->fl_mode) &&
++		!(flp->flags & RPMFILE_GHOST)) {
++	    appendStringBuf(check_fileList_bin_pkg, "path=");
++	    appendStringBuf(check_fileList_bin_pkg, flp->diskPath);
++	    snprintf(file_info, sizeof(file_info),
++		"|digestalgopgp=%d|digest=%s|mode=%d"
++		"|uname=%s|gname=%s|caps=%s\n",
++		digestalgo, file_digest, flp->fl_mode,
++		rpmstrPoolStr(fl->pool, flp->uname),
++		rpmstrPoolStr(fl->pool, flp->gname), flp->caps &&
++		strlen(flp->caps) ? flp->caps : "");
++	    appendStringBuf(check_fileList_bin_pkg, file_info);
++	}
++    }
++
++    if (!processed) {
++	if (genDigestList(pkg->header, fl, check_fileList_bin_pkg) > 0) {
++	    fl->processingFailed = 1;
++	} else if (i < fl->files.used) {
++	    pkg->dpaths = xrealloc(pkg->dpaths,
++				   (fl->files.used + 1) * sizeof(*pkg->dpaths));
++	    processed = i;
++	    goto process_files;
++	}
+     }
++
+     pkg->dpaths[npaths] = NULL;
+ 
+     if (totalFileSize < UINT32_MAX) {
+@@ -1343,8 +1380,8 @@ static int validFilename(const char *fn)
+  * @param statp		file stat (possibly NULL)
+  * @return		RPMRC_OK on success
+  */
+-static rpmRC addFile(FileList fl, const char * diskPath,
+-		struct stat * statp)
++static rpmRC addFile_common(FileList fl, const char * diskPath,
++		struct stat * statp, int digest_list)
+ {
+     size_t plen = strlen(diskPath);
+     char buf[plen + 1];
+@@ -1355,6 +1392,10 @@ static rpmRC addFile(FileList fl, const char * diskPath,
+     gid_t fileGid;
+     const char *fileUname;
+     const char *fileGname;
++    char realPath[PATH_MAX];
++    int digest_list_prefix = 0;
++    struct stat st;
++    int exclude = 0;
+     rpmRC rc = RPMRC_FAIL; /* assume failure */
+ 
+     /* Strip trailing slash. The special case of '/' path is handled below. */
+@@ -1390,6 +1431,33 @@ static rpmRC addFile(FileList fl, const char * diskPath,
+     if (*cpioPath == '\0')
+ 	cpioPath = "/";
+ 
++    snprintf(realPath, sizeof(realPath), "%s", diskPath);
++    rpmCleanPath(realPath);
++
++    digest_list_prefix = (!strncmp(realPath, digest_list_dir,
++			  strlen(digest_list_dir)));
++
++    if ((!digest_list && digest_list_prefix) ||
++	(digest_list && !digest_list_prefix)) {
++	    rc = RPMRC_OK;
++	    goto exit;
++    }
++
++    if (digest_list) {
++	if (strncmp(cpioPath, DIGEST_LIST_DIR, sizeof(DIGEST_LIST_DIR) - 1)) {
++	    rc = RPMRC_OK;
++	    goto exit;
++	}
++
++	cpioPath += sizeof(DIGEST_LIST_DIR) - 1;
++
++	snprintf(realPath, sizeof(realPath), "%.*s%s",
++		 (int)(strlen(digest_list_dir) - sizeof(DIGEST_LIST_DIR) + 1),
++		 digest_list_dir, cpioPath);
++	if (!stat(realPath, &st))
++	    exclude = 1;
++    }
++
+     /*
+      * Unless recursing, we dont have stat() info at hand. Handle the
+      * various cases, preserving historical behavior wrt %dev():
+@@ -1527,6 +1595,8 @@ static rpmRC addFile(FileList fl, const char * diskPath,
+ 	}
+ 
+ 	flp->flags = fl->cur.attrFlags;
++	if (exclude)
++	    flp->flags |= RPMFILE_EXCLUDE;
+ 	flp->specdFlags = fl->cur.specdFlags;
+ 	flp->verifyFlags = fl->cur.verifyFlags;
+ 
+@@ -1547,6 +1617,32 @@ exit:
+     return rc;
+ }
+ 
++/**
++ * Add a file to the package manifest.
++ * @param fl		package file tree walk data
++ * @param diskPath	path to file
++ * @param statp		file stat (possibly NULL)
++ * @return		RPMRC_OK on success
++ */
++static rpmRC addFile(FileList fl, const char * diskPath,
++		struct stat * statp)
++{
++	return addFile_common(fl, diskPath, statp, 0);
++}
++
++/**
++ * Add a digest list to the package manifest.
++ * @param fl		package file tree walk data
++ * @param diskPath	path to digest list
++ * @param statp		file stat (possibly NULL)
++ * @return		RPMRC_OK on success
++ */
++static rpmRC addDigestList(FileList fl, const char * diskPath,
++		struct stat * statp)
++{
++	return addFile_common(fl, diskPath, statp, 1);
++}
++
+ /**
+  * Add directory (and all of its files) to the package manifest.
+  * @param fl		package file tree walk data
+@@ -2556,6 +2652,58 @@ static void addPackageFileList (struct FileList_s *fl, Package pkg,
+     argvFree(fileNames);
+ }
+ 
++/**
++ * Generate digest lists list for current binary package.
++ * @header		package header
++ * @fl			file list
++ * @param fileList	packaged file list
++ * @return		-1 if skipped, 0 on OK, 1 on error
++ */
++static int genDigestList(Header header, FileList fl, StringBuf fileList)
++{
++    const char *errorString;
++    char *binFormat = rpmGetPath("%{_rpmfilename}", NULL);
++    char *binRpm = headerFormat(header, binFormat, &errorString);
++    static char * av_brp[] = { "%{?__brp_digest_list}", DIGEST_LIST_DIR + 1, NULL, NULL };
++    StringBuf sb_stdout = NULL;
++    int rc = -1;
++    char * s = rpmExpand(av_brp[0], NULL);
++
++    if (!(s && *s))
++	goto exit;
++
++    av_brp[2] = strchr(binRpm, '/') + 1;
++    rpmlog(RPMLOG_NOTICE, _("Generating digest list: %s\n"), s);
++
++    rc = rpmfcExec(av_brp, fileList, &sb_stdout, 0, binRpm);
++    if (sb_stdout && getStringBuf(sb_stdout)) {
++	const char * t = getStringBuf(sb_stdout), *ptr;
++	char *digest_list_path;
++
++	while((ptr = strchr(t, '\n'))) {
++	    digest_list_path = strndup(t, ptr - t);
++	    if (!digest_list_path) {
++		rc = -1;
++		goto exit;
++	    }
++	    FileEntryFree(&fl->cur);
++	    resetPackageFilesDefaults(fl, fl->pkgFlags);
++	    rc = addDigestList(fl, digest_list_path, NULL);
++	    free(digest_list_path);
++	    if (rc != RPMRC_OK)
++		break;
++
++	    t = ptr + 1;
++	}
++    }
++exit:
++    free(binFormat);
++    free(binRpm);
++    free(s);
++    freeStringBuf(sb_stdout);
++    return rc;
++}
++
+ static rpmRC processPackageFiles(rpmSpec spec, rpmBuildPkgFlags pkgFlags,
+ 				 Package pkg, int didInstall, int test)
+ {
+@@ -2569,6 +2717,10 @@ static rpmRC processPackageFiles(rpmSpec spec, rpmBuildPkgFlags pkgFlags,
+ 	if (readFilesManifest(spec, pkg, *fp))
+ 	    return RPMRC_FAIL;
+     }
++
++    /* Init the buffer containing the list of packaged files */
++    check_fileList_bin_pkg = newStringBuf();
++
+     /* Init the file list structure */
+     memset(&fl, 0, sizeof(fl));
+ 
+@@ -2630,6 +2782,7 @@ exit:
+     FileListFree(&fl);
+     specialDirFree(specialDoc);
+     specialDirFree(specialLic);
++    freeStringBuf(check_fileList_bin_pkg);
+     return fl.processingFailed ? RPMRC_FAIL : RPMRC_OK;
+ }
+ 
+@@ -3092,6 +3245,7 @@ static void addPackageDeps(Package from, Package to, enum rpmTag_e tag)
+ rpmRC processBinaryFiles(rpmSpec spec, rpmBuildPkgFlags pkgFlags,
+ 			int didInstall, int test)
+ {
++    struct stat st;
+     Package pkg;
+     rpmRC rc = RPMRC_OK;
+     char *buildroot;
+@@ -3108,7 +3262,14 @@ rpmRC processBinaryFiles(rpmSpec spec, rpmBuildPkgFlags pkgFlags,
+     check_fileList = newStringBuf();
+     genSourceRpmName(spec);
+     buildroot = rpmGenPath(spec->rootDir, spec->buildRoot, NULL);
+-    
++
++    digest_list_dir = rpmGenPath(buildroot, DIGEST_LIST_DIR, NULL);
++    if (!digest_list_dir)
++	goto exit;
++
++    if (!stat(digest_list_dir, &st))
++	rpmlog(RPMLOG_NOTICE, _("Ignoring files in: %s\n"), digest_list_dir);
++
+     if (rpmExpandNumeric("%{?_debuginfo_subpackages}")) {
+ 	maindbg = findDebuginfoPackage(spec);
+ 	if (maindbg) {
+@@ -3214,6 +3375,7 @@ exit:
+     check_fileList = freeStringBuf(check_fileList);
+     _free(buildroot);
+     _free(uniquearch);
+-    
++    _free(digest_list_dir);
++
+     return rc;
+ }
+-- 
+2.27.GIT
+

@@ -1,0 +1,26 @@
+From 1b33543094337e1edf6b7806d0cffed5ea6b0629 Mon Sep 17 00:00:00 2001
+From: Anakin Zhang <benjamin93@163.com>
+Date: Thu, 24 Sep 2020 23:51:51 +0800
+Subject: [PATCH]  carry xattr when copying files to initramfs
+
+Signed-off-by: Anakin Zhang <benjamin93@163.com>
+---
+ scripts/plymouth-populate-initrd.in | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/scripts/plymouth-populate-initrd.in b/scripts/plymouth-populate-initrd.in
+index 616ecc4..100724d 100644
+--- a/scripts/plymouth-populate-initrd.in
++++ b/scripts/plymouth-populate-initrd.in
+@@ -144,7 +144,7 @@ inst_simple() {
+         inst "${_src%/*}/.${_src##*/}.hmac" "${target%/*}/.${target##*/}.hmac"
+     fi
+     ddebug "Installing $_src"
+-    cp --sparse=always -pfL "$PLYMOUTH_SYSROOT$_src" "${initdir}/$target"
++    cp -a --sparse=always -pfL "$PLYMOUTH_SYSROOT$_src" "${initdir}/$target"
+ }
+ 
+ # find symlinks linked to given library file
+-- 
+2.23.0.windows.1
+

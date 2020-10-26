@@ -1,0 +1,12 @@
+diff -uprN selinux-policy-9c84d687e0fef5d8e4e25273bd25f58c28a7c67c.orig/policy/modules/contrib/firewalld.fc selinux-policy-9c84d687e0fef5d8e4e25273bd25f58c28a7c67c/policy/modules/contrib/firewalld.fc
+--- selinux-policy-9c84d687e0fef5d8e4e25273bd25f58c28a7c67c.orig/policy/modules/contrib/firewalld.fc	2020-09-03 14:43:46.690880806 +0200
++++ selinux-policy-9c84d687e0fef5d8e4e25273bd25f58c28a7c67c/policy/modules/contrib/firewalld.fc	2020-09-10 17:25:25.126199087 +0200
+@@ -6,6 +6,8 @@
+ 
+ /usr/sbin/firewalld	--	gen_context(system_u:object_r:firewalld_exec_t,s0)
+ 
++/usr/share/firewalld/firewalld-tmp-mmap	--	gen_context(system_u:object_r:firewalld_tmp_t,s0)
++
+ /var/log/firewalld.*	--	gen_context(system_u:object_r:firewalld_var_log_t,s0)
+ 
+ /var/run/firewalld(/.*)?	gen_context(system_u:object_r:firewalld_var_run_t,s0)
