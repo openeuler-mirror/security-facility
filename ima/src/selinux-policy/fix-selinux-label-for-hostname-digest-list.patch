@@ -1,0 +1,25 @@
+From 7d436dc2f9498bc77d55cbd1da0be8233bdc190e Mon Sep 17 00:00:00 2001
+From: guoxiaoqi <guoxiaoqi2@huawei.com>
+Date: Thu, 4 Jun 2020 20:31:18 +0800
+Subject: [PATCH] fix selinux label for hostname digest list
+
+Signed-off-by: guoxiaoqi <guoxiaoqi2@huawei.com>
+---
+ policy/modules/system/systemd.fc | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/policy/modules/system/systemd.fc b/policy/modules/system/systemd.fc
+index cfafbfa..bb5e759 100644
+--- a/policy/modules/system/systemd.fc
++++ b/policy/modules/system/systemd.fc
+@@ -3,6 +3,7 @@ HOME_DIR/\.config/systemd/user(/.*)?		gen_context(system_u:object_r:systemd_unit
+ /root/\.local/share/systemd(/.*)?		gen_context(system_u:object_r:systemd_home_t,s0)
+ 
+ /etc/.*hostname.*			--		gen_context(system_u:object_r:hostname_etc_t,s0)
++/etc/[^/]*hostname.*                    --              gen_context(system_u:object_r:hostname_etc_t,s0)
+ /etc/machine-info		--		gen_context(system_u:object_r:hostname_etc_t,s0)
+ /etc/udev/.*hwdb.*	--	gen_context(system_u:object_r:systemd_hwdb_etc_t,s0)
+ 
+-- 
+1.8.3.1
+

@@ -1,0 +1,115 @@
+From 641ec5a50cb5057e02c4cfe7bd537a32fafdd665 Mon Sep 17 00:00:00 2001
+From: Roberto Sassu <roberto.sassu@huawei.com>
+Date: Mon, 26 Oct 2020 12:10:31 +0800
+Subject: [PATCH] call process_digest_list after files are added
+
+Signed-off-by: Anakin Zhang <benjamin93@163.com>
+---
+ plugins/digest_list.c | 78 ++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 69 insertions(+), 9 deletions(-)
+
+diff --git a/plugins/digest_list.c b/plugins/digest_list.c
+index 9fcb5c4..7213b41 100644
+--- a/plugins/digest_list.c
++++ b/plugins/digest_list.c
+@@ -479,28 +479,88 @@ out:
+ 	return ret;
+ }
+ 
++rpmte cur_te;
++int digest_list_counter;
++
+ static rpmRC digest_list_psm_pre(rpmPlugin plugin, rpmte te)
+ {
+-	process_digest_list(te, 0);
+-	if (!strcmp(rpmteN(te), "digest-list-tools"))
+-		process_digest_list(te, 1);
++	Header rpm = rpmteHeader(te);
++	rpmtd dirnames;
++	int i;
++
++	digest_list_counter = 0;
++
++	dirnames = rpmtdNew();
++	headerGet(rpm, RPMTAG_DIRNAMES, dirnames, 0);
++
++	while ((i = rpmtdNext(dirnames)) >= 0) {
++		char *dirname = (char *) rpmtdGetString(dirnames);
++		if (!strncmp(dirname, DIGEST_LIST_DEFAULT_PATH,
++			     sizeof(DIGEST_LIST_DEFAULT_PATH) - 1))
++			digest_list_counter++;
++	}
+ 
++	rpmtdFree(dirnames);
++
++	cur_te = te;
+ 	return RPMRC_OK;
+ }
+ 
+-static rpmRC digest_list_psm_post(rpmPlugin plugin, rpmte te, int res)
++static rpmRC digest_list_file_common(rpmPlugin plugin, rpmfi fi,
++				     const char* path, mode_t file_mode,
++				     rpmFsmOp op, int pre, int res)
+ {
+-	if (res != RPMRC_OK)
++	rpmFileAction action = XFO_ACTION(op);
++
++	if (!digest_list_counter)
++		return RPMRC_OK;
++
++	if (!cur_te)
++		return RPMRC_OK;
++
++	if (!pre && res != RPMRC_OK)
++		return res;
++
++	if ((pre && action != FA_ERASE) ||
++	    (!pre && action != FA_CREATE))
+ 		return RPMRC_OK;
+ 
+-	process_digest_list(te, 0);
+-	if (!strcmp(rpmteN(te), "digest-list-tools"))
+-		process_digest_list(te, 1);
++	if (digest_list_counter) {
++		if (!pre) {
++			if (!strncmp(path, DIGEST_LIST_DEFAULT_PATH,
++				     sizeof(DIGEST_LIST_DEFAULT_PATH) - 1))
++				digest_list_counter--;
++		} else {
++			digest_list_counter = 0;
++		}
++
++		if (digest_list_counter)
++			return RPMRC_OK;
++	}
++
++	process_digest_list(cur_te, 0);
++	if (!strcmp(rpmteN(cur_te), "digest-list-tools"))
++		process_digest_list(cur_te, 1);
+ 
+ 	return RPMRC_OK;
+ }
+ 
++static rpmRC digest_list_file_pre(rpmPlugin plugin, rpmfi fi,
++				  const char* path, mode_t file_mode,
++				  rpmFsmOp op)
++{
++	return digest_list_file_common(plugin, fi, path, file_mode, op, 1, 0);
++}
++
++static rpmRC digest_list_file_post(rpmPlugin plugin, rpmfi fi,
++				  const char* path, mode_t file_mode,
++				  rpmFsmOp op, int res)
++{
++	return digest_list_file_common(plugin, fi, path, file_mode, op, 0, res);
++}
++
+ struct rpmPluginHooks_s digest_list_hooks = {
+ 	.psm_pre = digest_list_psm_pre,
+-	.psm_post = digest_list_psm_post,
++	.fsm_file_pre = digest_list_file_pre,
++	.fsm_file_post = digest_list_file_post,
+ };
+-- 
+2.23.0
+

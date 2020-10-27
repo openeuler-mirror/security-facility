@@ -1,0 +1,26 @@
+From 90b01a63c7c3312c25d2c3b74508a98b51e703fa Mon Sep 17 00:00:00 2001
+From: Roberto Sassu <roberto.sassu@huawei.com>
+Date: Wed, 22 Jul 2020 17:24:58 +0200
+Subject: [PATCH 3/3] Don't add dist to release if it is already there
+
+---
+ build/parsePreamble.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/build/parsePreamble.c b/build/parsePreamble.c
+index 147059bb5..c3d898b4c 100644
+--- a/build/parsePreamble.c
++++ b/build/parsePreamble.c
+@@ -810,7 +810,8 @@ static rpmRC handlePreambleTag(rpmSpec spec, Package pkg, rpmTagVal tag,
+ 	SINGLE_TOKEN_ONLY;
+         if (tag == RPMTAG_RELEASE) {
+             char *dist = rpmExpand("%{?dist}",NULL);
+-            rasprintf(&field,"%s%s",field,dist);
++            rasprintf(&field,"%s%s",field,
++                      (dist && strstr(field, dist)) ? "" : dist);
+             free(dist);
+         }
+ 	if (rpmCharCheck(spec, field, WHITELIST_VERREL))
+-- 
+2.27.GIT
+

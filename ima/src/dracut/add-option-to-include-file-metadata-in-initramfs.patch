@@ -1,0 +1,79 @@
+From 9d267e664c6f95a7b940c5706643b055623a39d7 Mon Sep 17 00:00:00 2001
+From: Anakin Zhang <benjamin93@163.com>
+Date: Thu, 2 Jul 2020 14:46:51 +0800
+Subject: [PATCH] add option to include file metadata in initramfs
+
+Signed-off-by: Anakin Zhang <benjamin93@163.com>
+---
+ dracut.sh | 13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/dracut.sh b/dracut.sh
+index c14f6c0..572a60e 100755
+--- a/dracut.sh
++++ b/dracut.sh
+@@ -242,6 +242,9 @@ Creates initial ramdisk images for preloading modules
+   --kernel-image [FILE] location of the kernel image
+   --regenerate-all      Regenerate all initramfs images at the default location
+                         for the kernel versions found on the system
++  -e, --file-metadata [TYPE]
++                        Include file metadata in the initramfs. Specify "xattr"
++                        to include file extended attributes.
+ 
+ If [LIST] has multiple arguments, then you have to put these in quotes.
+ 
+@@ -319,7 +322,7 @@ rearrange_params()
+     set -- "${newat[@]}" # Set new $@
+ 
+     TEMP=$(unset POSIXLY_CORRECT; getopt \
+-        -o "a:m:o:d:I:k:c:r:L:fvqlHhMN" \
++        -o "a:m:o:d:I:k:c:r:L:fvqlHhMNe:" \
+         --long kver: \
+         --long add: \
+         --long force-add: \
+@@ -408,6 +411,7 @@ rearrange_params()
+         --long no-hostonly-i18n \
+         --long hostonly-i18n \
+         --long no-machineid \
++        --long file-metadata: \
+         -- "$@")
+ 
+     if (( $? != 0 )); then
+@@ -608,6 +612,8 @@ while :; do
+                        kernel_image_l="$2";            PARMS_TO_STORE+=" '$2'"; shift;;
+         --no-machineid)
+                        machine_id_l="no";;
++        -e|--file-metadata)
++                       file_metadata_l="$2";           PARMS_TO_STORE+=" '$2'"; shift;;
+         --) shift; break;;
+ 
+         *)  # should not even reach this point
+@@ -783,6 +789,7 @@ stdloglvl=$((stdloglvl + verbosity_mod_l))
+ [[ $uefi_splash_image_l ]] && uefi_splash_image="$uefi_splash_image_l"
+ [[ $kernel_image_l ]] && kernel_image="$kernel_image_l"
+ [[ $machine_id_l ]] && machine_id="$machine_id_l"
++[[ $file_metadata_l ]] && file_metadata_opt="-e $file_metadata_l"
+ 
+ if ! [[ $outfile ]]; then
+     if [[ $machine_id != "no" ]]; then
+@@ -1988,7 +1995,7 @@ if [[ $create_early_cpio = yes ]]; then
+     if ! (
+             umask 077; cd "$early_cpio_dir/d"
+             find . -print0 | sort -z \
+-                | cpio ${CPIO_REPRODUCIBLE:+--reproducible} --null $cpio_owner_root -H newc -o --quiet > "${DRACUT_TMPDIR}/initramfs.img"
++                | cpio ${CPIO_REPRODUCIBLE:+--reproducible} --null $cpio_owner_root -H newc $file_metadata_opt -o --quiet > "${DRACUT_TMPDIR}/initramfs.img"
+         ); then
+         dfatal "dracut: creation of $outfile failed"
+         exit 1
+@@ -1998,7 +2005,7 @@ fi
+ if ! (
+         umask 077; cd "$initdir"
+         find . -print0 | sort -z \
+-            | cpio ${CPIO_REPRODUCIBLE:+--reproducible} --null $cpio_owner_root -H newc -o --quiet \
++            | cpio ${CPIO_REPRODUCIBLE:+--reproducible} --null $cpio_owner_root -H newc $file_metadata_opt -o --quiet \
+             | $compress >> "${DRACUT_TMPDIR}/initramfs.img"
+     ); then
+     dfatal "dracut: creation of $outfile failed"
+-- 
+2.23.0
+

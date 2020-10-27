@@ -1,0 +1,96 @@
+#!/usr/bin/sh
+
+# Get build root
+RPM_BUILD_ROOT="${1}"
+
+# If using normal root, avoid changing anything.
+if [ -z "$RPM_BUILD_ROOT" -o "$RPM_BUILD_ROOT" = "/" ]; then
+	exit 0
+fi
+
+# Create temporary file listing files in the manifest
+#[ -n "$TMPDIR" ] || TMPDIR="/tmp"
+TMPDIR="/tmp"
+BIN_PKG_FILES=${TMPDIR}/${3%%.rpm}
+cat - > $BIN_PKG_FILES
+
+# Ensure temporary file is cleaned up when we exit
+trap "rm -f \"${BIN_PKG_FILES}\"" 0 2 3 5 10 13 15
+
+# File empty, exit
+if [ -z $(head -c 1 $BIN_PKG_FILES) ]; then
+	exit 0
+fi
+
+# Create directory for digest lists
+DIGEST_LIST_DIR=$RPM_BUILD_ROOT/$2/etc/ima/digest_lists
+mkdir -p $DIGEST_LIST_DIR
+mkdir -p $DIGEST_LIST_DIR.tlv
+mkdir -p $DIGEST_LIST_DIR.sig
+
+# Generate digest list for the kernel
+gen_digest_lists -i M: -t metadata -f compact -d $DIGEST_LIST_DIR -i l:policy \
+	-i i: -o add -p -1 -m immutable -i L:$BIN_PKG_FILES -i u: \
+	-A $RPM_BUILD_ROOT -i e: \
+	-i F:/lib \
+	-i F:/usr/lib \
+	-i F:/lib64 \
+	-i F:/usr/lib64 \
+	-i F:/lib/modules \
+	-i F:/usr/lib/modules \
+	-i F:/lib/firmware \
+	-i F:/usr/lib/firmware
+
+f="$DIGEST_LIST_DIR/0-metadata_list-compact-$(basename $BIN_PKG_FILES)"
+[ -f $f ] || exit 0
+
+chmod 644 $f
+echo $f
+
+# Generate TLV digest list to check metadata
+gen_digest_lists -i M: -t metadata -f compact -d $DIGEST_LIST_DIR.tlv \
+	-i l:policy -i i: -o add -p -1 -m immutable -i L:$BIN_PKG_FILES -i u: \
+	-T -A $RPM_BUILD_ROOT -i e: \
+	-i F:/lib \
+	-i F:/usr/lib \
+	-i F:/lib64 \
+	-i F:/usr/lib64 \
+	-i F:/lib/modules \
+	-i F:/usr/lib/modules \
+	-i F:/lib/firmware \
+	-i F:/usr/lib/firmware
+
+f="$DIGEST_LIST_DIR.tlv/0-metadata_list-compact_tlv-$(basename $BIN_PKG_FILES)"
+[ -f $f ] || exit 0
+
+chmod 644 $f
+echo $f
+
+if [[ "$(basename $BIN_PKG_FILES)" =~ "digest-list-tools" && \
+      ! $(basename $BIN_PKG_FILES) =~ "debug" ]]; then
+	# Generate digest list for the user space parsers
+	LD_LIBRARY_PATH=$RPM_BUILD_ROOT/usr/lib64 \
+		$RPM_BUILD_ROOT/usr/bin/gen_digest_lists \
+		-d $DIGEST_LIST_DIR -t parser -f compact -m immutable \
+		-i I:$RPM_BUILD_ROOT/usr/libexec -o add -p -1 -i i:
+
+	f="$DIGEST_LIST_DIR/0-parser_list-compact-libexec"
+	[ -f $f ] || exit 0
+
+	chmod 644 $f
+	echo $f
+
+	[ -f /usr/lib/rpm/brp-suse.d/brp-99-pesign ] || exit 0
+
+	BRP_PESIGN_FILES="$2/etc/ima/digest_lists/*"
+	export BRP_PESIGN_FILES
+	export RPM_BUILD_ROOT
+	RPM_PACKAGE_NAME="digest-list-tools"
+	export RPM_PACKAGE_NAME
+	RPM_SOURCE_DIR="$(rpm --eval %_topdir)/SOURCES"
+	export RPM_SOURCE_DIR
+
+	if [ -f "/usr/lib/rpm/brp-suse.d/brp-99-pesign" ]; then
+		/usr/lib/rpm/brp-suse.d/brp-99-pesign &> /dev/null
+	fi
+fi

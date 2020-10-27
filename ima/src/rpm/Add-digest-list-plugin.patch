@@ -1,0 +1,585 @@
+From e49074a4e4bd0699d2c4a5bb3a0dc5ca45e19e12 Mon Sep 17 00:00:00 2001
+From: Roberto Sassu <roberto.sassu@huawei.com>
+Date: Wed, 26 Feb 2020 15:54:24 +0100
+Subject: [PATCH 2/3] Add digest list plugin
+
+---
+ macros.in             |   1 +
+ plugins/Makefile.am   |   4 +
+ plugins/digest_list.c | 498 ++++++++++++++++++++++++++++++++++++++++++
+ rpmio/digest.h        |   1 +
+ rpmio/rpmpgp.c        |   3 +
+ 5 files changed, 507 insertions(+)
+ create mode 100644 plugins/digest_list.c
+
+diff --git a/macros.in b/macros.in
+index 402749362..8619c1323 100644
+--- a/macros.in
++++ b/macros.in
+@@ -1184,6 +1184,7 @@ package or when debugging this package.\
+ %__transaction_ima		%{__plugindir}/ima.so
+ %__transaction_prioreset	%{__plugindir}/prioreset.so
+ %__transaction_audit		%{__plugindir}/audit.so
++%__transaction_digest_list	%{__plugindir}/digest_list.so
+ 
+ #------------------------------------------------------------------------------
+ # Macros for further automated spec %setup and patch application
+diff --git a/plugins/Makefile.am b/plugins/Makefile.am
+index d4ef039ed..07aa3585b 100644
+--- a/plugins/Makefile.am
++++ b/plugins/Makefile.am
+@@ -48,3 +48,7 @@ audit_la_sources = audit.c
+ audit_la_LIBADD = $(top_builddir)/lib/librpm.la $(top_builddir)/rpmio/librpmio.la @WITH_AUDIT_LIB@
+ plugins_LTLIBRARIES += audit.la
+ endif
++
++digest_list_la_sources = digest_list.c
++digest_list_la_LIBADD = $(top_builddir)/lib/librpm.la $(top_builddir)/rpmio/librpmio.la
++plugins_LTLIBRARIES += digest_list.la
+diff --git a/plugins/digest_list.c b/plugins/digest_list.c
+new file mode 100644
+index 000000000..beb397309
+--- /dev/null
++++ b/plugins/digest_list.c
+@@ -0,0 +1,498 @@
++#include "system.h"
++#include "errno.h"
++
++#include <rpm/rpmlog.h>
++#include <rpm/rpmts.h>
++#include <rpm/header.h>
++#include <rpmio/digest.h>
++#include <rpmio/rpmpgp.h>
++#include <rpm/rpmfileutil.h>
++#include "lib/rpmplugin.h"
++#include <netinet/in.h>
++#include <sys/stat.h>
++#include <openssl/sha.h>
++#include <sys/xattr.h>
++#include <linux/xattr.h>
++#include <asm/byteorder.h>
++#include <sys/wait.h>
++
++#include "debug.h"
++
++#define IMA_DIR "/sys/kernel/security/ima"
++#define DIGEST_LIST_DATA_PATH IMA_DIR "/digest_list_data"
++#define DIGEST_LIST_DATA_DEL_PATH IMA_DIR "/digest_list_data_del"
++#define DIGEST_LIST_COUNT IMA_DIR "/digests_count"
++#define DIGEST_LIST_DEFAULT_PATH "/etc/ima/digest_lists"
++#define RPM_PARSER "/usr/libexec/rpm_parser"
++
++#define DIGEST_LIST_OP_ADD 0
++#define DIGEST_LIST_OP_DEL 1
++
++enum hash_algo {
++	HASH_ALGO_MD4,
++	HASH_ALGO_MD5,
++	HASH_ALGO_SHA1,
++	HASH_ALGO_RIPE_MD_160,
++	HASH_ALGO_SHA256,
++	HASH_ALGO_SHA384,
++	HASH_ALGO_SHA512,
++	HASH_ALGO_SHA224,
++	HASH_ALGO_RIPE_MD_128,
++	HASH_ALGO_RIPE_MD_256,
++	HASH_ALGO_RIPE_MD_320,
++	HASH_ALGO_WP_256,
++	HASH_ALGO_WP_384,
++	HASH_ALGO_WP_512,
++	HASH_ALGO_TGR_128,
++	HASH_ALGO_TGR_160,
++	HASH_ALGO_TGR_192,
++	HASH_ALGO_SM3_256,
++	HASH_ALGO__LAST
++};
++
++#define PGPHASHALGO__LAST PGPHASHALGO_SHA224 + 1
++enum hash_algo pgp_algo_mapping[PGPHASHALGO__LAST] = {
++	[PGPHASHALGO_MD5] = HASH_ALGO_MD5,
++	[PGPHASHALGO_SHA1] = HASH_ALGO_SHA1,
++	[PGPHASHALGO_SHA224] = HASH_ALGO_SHA224,
++	[PGPHASHALGO_SHA256] = HASH_ALGO_SHA256,
++	[PGPHASHALGO_SHA384] = HASH_ALGO_SHA384,
++	[PGPHASHALGO_SHA512] = HASH_ALGO_SHA512,
++};
++
++/* from integrity.h */
++enum evm_ima_xattr_type {
++	IMA_XATTR_DIGEST = 0x01,
++	EVM_XATTR_HMAC,
++	EVM_IMA_XATTR_DIGSIG,
++	IMA_XATTR_DIGEST_NG,
++	EVM_XATTR_PORTABLE_DIGSIG,
++	EVM_IMA_XATTR_DIGEST_LIST,
++	IMA_XATTR_LAST
++};
++
++struct evm_ima_xattr_data {
++	uint8_t type;
++	uint8_t digest[SHA512_DIGEST_LENGTH + 1];
++} __attribute__((packed));
++
++struct signature_v2_hdr {
++	uint8_t type;		/* xattr type */
++	uint8_t version;	/* signature format version */
++	uint8_t hash_algo;	/* Digest algorithm [enum hash_algo] */
++	__be32 keyid;		/* IMA key identifier - not X509/PGP specific */
++	__be16 sig_size;	/* signature size */
++	uint8_t sig[0];		/* signature payload */
++} __attribute__((packed));
++
++static int upload_digest_list(char *path, int type, int digest_list_signed)
++{
++	size_t size;
++	char buf[21];
++	const char *ima_path = DIGEST_LIST_DATA_PATH;
++	struct stat st;
++	pid_t pid;
++	int ret = 0, fd;
++
++	if (type == TR_REMOVED)
++		ima_path = DIGEST_LIST_DATA_DEL_PATH;
++
++	if (stat(ima_path, &st) == -1)
++		return 0;
++
++	/* First determine if kernel interface can accept new digest lists */
++	fd = open(DIGEST_LIST_COUNT, O_RDONLY);
++	if (fd < 0) {
++		rpmlog(RPMLOG_ERR, "digest_list: could not open IMA interface "
++		       "'%s': %s\n", DIGEST_LIST_COUNT, strerror(errno));
++		return -EACCES;
++	}
++
++	ret = read(fd, buf, sizeof(buf));
++	close(fd);
++
++	if (ret <= 0) {
++		rpmlog(RPMLOG_ERR, "digest_list: could not read from IMA "
++		       "interface '%s': %s\n", DIGEST_LIST_COUNT,
++		       strerror(errno));
++		return -EACCES;
++	}
++
++	/* Last character is newline */
++	buf[ret - 1] = '\0';
++
++	rpmlog(RPMLOG_DEBUG, "digest_list: digests count %s\n", buf);
++
++	if (*buf == '0') {
++		rpmlog(RPMLOG_DEBUG, "digest_list: not uploading '%s' to IMA "
++		       "interface '%s'\n", path, ima_path);
++		return RPMRC_OK;
++	}
++
++	/* If the digest list is not signed, execute the RPM parser */
++	if (!digest_list_signed) {
++		if ((pid = fork()) == 0) {
++			execlp(RPM_PARSER, RPM_PARSER, (type == TR_ADDED) ?
++			       "add" : "del", path, NULL);
++			_exit(EXIT_FAILURE);
++		}
++
++		waitpid(pid, &ret, 0);
++		if (ret != 0)
++			rpmlog(RPMLOG_ERR, "digest_list: %s returned %d\n",
++			       RPM_PARSER, ret);
++		return 0;
++	}
++
++	fd = open(ima_path, O_WRONLY);
++	if (fd < 0) {
++		rpmlog(RPMLOG_ERR, "digest_list: could not open IMA interface "
++		       "'%s': %s\n", ima_path, strerror(errno));
++		return -EACCES;
++	}
++
++	/* Write the path of the digest list to securityfs */
++	size = write(fd, path, strlen(path));
++	if (size != strlen(path)) {
++		rpmlog(RPMLOG_ERR, "digest_list: could not write '%s' to IMA "
++		       "interface '%s': %s\n", path, ima_path, strerror(errno));
++		ret = -EIO;
++		goto out;
++	}
++
++	rpmlog(RPMLOG_DEBUG, "digest_list: written '%s' to '%s'\n", path,
++	       ima_path);
++out:
++	close(fd);
++	return ret;
++}
++
++static int write_rpm_digest_list(rpmte te, char *path)
++{
++	FD_t fd;
++	ssize_t written;
++	Header rpm = rpmteHeader(te);
++	rpmtd immutable;
++	int ret = 0;
++
++	immutable = rpmtdNew();
++	headerGet(rpm, RPMTAG_HEADERIMMUTABLE, immutable, 0);
++
++	fd = Fopen(path, "w.ufdio");
++	if (fd == NULL || Ferror(fd)) {
++		ret = -EACCES;
++		goto out;
++	}
++
++	written = Fwrite(rpm_header_magic, sizeof(uint8_t),
++			 sizeof(rpm_header_magic), fd);
++
++	if (written != sizeof(rpm_header_magic)) {
++		ret = -EIO;
++		goto out;
++	}
++
++	written = Fwrite(immutable->data, sizeof(uint8_t),
++			 immutable->count, fd);
++	if (written != immutable->count || Ferror(fd))
++		ret = -EIO;
++out:
++	Fclose(fd);
++	rpmtdFree(immutable);
++	return ret;
++}
++
++static int write_rpm_digest_list_ima_xattr(rpmte te, char *path)
++{
++	rpmtd signature;
++	ssize_t written;
++	uint8_t sig[2048] = { 0 };
++	pgpDigParams sigp = NULL;
++	struct signature_v2_hdr *sig_hdr = (struct signature_v2_hdr *)sig;
++	Header rpm = rpmteHeader(te);
++	FD_t fd;
++	int ret = 0, sig_size, sig_size_rounded;
++
++	signature = rpmtdNew();
++	headerGet(rpm, RPMTAG_RSAHEADER, signature, 0);
++	ret = pgpPrtParams(signature->data, signature->count,
++			   PGPTAG_SIGNATURE, &sigp);
++
++	if (ret) {
++		ret = -ENOENT;
++		goto out;
++	}
++
++	fd = Fopen(path, "a.ufdio");
++	if (fd == NULL || Ferror(fd)) {
++		ret = -EACCES;
++		goto out;
++	}
++
++	written = Fwrite(sigp->hash, sizeof(uint8_t),
++			 sigp->hashlen, fd);
++	if (written != sigp->hashlen || Ferror(fd)) {
++		ret = -EIO;
++		goto out;
++	}
++
++	if (sigp->version == 4) {
++		/* V4 trailer is six octets long (rfc4880) */
++		uint8_t trailer[6];
++		uint32_t nb = sigp->hashlen;
++		nb = htonl(nb);
++		trailer[0] = sigp->version;
++		trailer[1] = 0xff;
++		memcpy(trailer+2, &nb, 4);
++
++		written = Fwrite(trailer, sizeof(uint8_t), sizeof(trailer), fd);
++		if (written != sizeof(trailer) || Ferror(fd)) {
++			ret = -EIO;
++			goto out;
++		}
++	}
++
++	Fclose(fd);
++
++	sig_hdr->type = EVM_IMA_XATTR_DIGSIG;
++	sig_hdr->version = 2;
++	sig_hdr->hash_algo = pgp_algo_mapping[sigp->hash_algo];
++	memcpy((void *)&sig_hdr->keyid, sigp->signid + sizeof(uint32_t),
++	       sizeof(uint32_t));
++
++	sig_size = (pgpMpiBits(sigp->data) + 7) >> 3;
++	if (sizeof(sig_hdr) + sig_size > sizeof(sig)) {
++		rpmlog(RPMLOG_ERR,
++		       "digest_list: signature in %s too big\n", path);
++		ret = -E2BIG;
++		goto out;
++	}
++
++	sig_size_rounded = ((sig_size + 7) >> 3) * 8;
++	sig_hdr->sig_size = __cpu_to_be16(sig_size_rounded);
++
++	memcpy(sig_hdr->sig + sig_size_rounded - sig_size,
++	       (uint8_t *)sigp->data + 2, sig_size);
++
++	ret = lsetxattr(path, XATTR_NAME_IMA,
++			sig, sizeof(*sig_hdr) + sig_size_rounded, 0);
++	if (ret < 0)
++		rpmlog(RPMLOG_ERR, "digest_list: could not apply security.ima "
++		       "on '%s': %s\n", path, strerror(errno));
++	else
++		rpmlog(RPMLOG_DEBUG, "digest_list: security.ima successfully "
++		       "applied on '%s'\n", path);
++out:
++	pgpDigParamsFree(sigp);
++	rpmtdFree(signature);
++	return ret;
++}
++
++static int write_digest_list_ima_xattr(rpmte te, char *path, char *path_sig)
++{
++	rpmtd signature;
++	uint8_t sig[2048] = { 0 };
++	pgpDigParams sigp = NULL;
++	struct signature_v2_hdr *sig_hdr = (struct signature_v2_hdr *)sig;
++	Header rpm = rpmteHeader(te);
++	FD_t fd;
++	struct stat st;
++	int ret = 0, sig_size;
++
++	signature = rpmtdNew();
++	headerGet(rpm, RPMTAG_RSAHEADER, signature, 0);
++	ret = pgpPrtParams(signature->data, signature->count,
++			   PGPTAG_SIGNATURE, &sigp);
++
++	if (ret) {
++		ret = -ENOENT;
++		goto out;
++	}
++
++	sig_hdr->type = EVM_IMA_XATTR_DIGSIG;
++	sig_hdr->version = 2;
++	sig_hdr->hash_algo = HASH_ALGO_SHA256;
++	memcpy((void *)&sig_hdr->keyid, sigp->signid + sizeof(uint32_t),
++	       sizeof(uint32_t));
++
++	if (stat(path_sig, &st) == -1) {
++		ret = -EACCES;
++		goto out;
++	}
++
++	if (sizeof(sig_hdr) + st.st_size > sizeof(sig)) {
++		rpmlog(RPMLOG_ERR, "digest_list: signature in %s too big\n",
++		       path);
++		ret = -E2BIG;
++		goto out;
++	}
++
++	fd = Fopen(path_sig, "r.ufdio");
++	if (fd < 0) {
++		rpmlog(RPMLOG_ERR, "digest_list: could not open '%s': %s\n",
++		       path_sig, strerror(errno));
++		ret = -EACCES;
++		goto out;
++	}
++
++	sig_size = Fread(sig_hdr->sig, sizeof(uint8_t), st.st_size, fd);
++	if (sig_size != st.st_size || Ferror(fd)) {
++		rpmlog(RPMLOG_ERR, "digest_list: could not read '%s': %s\n",
++		       path_sig, strerror(errno));
++		Fclose(fd);
++		ret = -EIO;
++		goto out;
++	}
++
++	sig_hdr->sig_size = __cpu_to_be16(sig_size);
++
++	rpmlog(RPMLOG_DEBUG,
++	       "digest_list: read signature of %d bytes from '%s'\n",
++	       sig_size, path_sig);
++
++	ret = lsetxattr(path, XATTR_NAME_IMA,
++			sig, sizeof(*sig_hdr) + sig_size, 0);
++	if (ret < 0)
++		rpmlog(RPMLOG_ERR, "digest_list: could not apply security.ima "
++		       "on '%s': %s\n", path, strerror(errno));
++	else
++		rpmlog(RPMLOG_DEBUG, "digest_list: security.ima successfully "
++		       "applied on '%s'\n", path);
++out:
++	pgpDigParamsFree(sigp);
++	rpmtdFree(signature);
++	return ret;
++}
++
++static int process_digest_list(rpmte te, int parser)
++{
++	char *path = NULL, *path_sig = NULL;
++	int digest_list_signed = 0;
++	struct stat st;
++	ssize_t size;
++	rpmRC ret = RPMRC_OK;
++
++	path = malloc(PATH_MAX);
++	if (!path) {
++		ret = RPMRC_FAIL;
++		goto out;
++	}
++
++	path_sig = malloc(PATH_MAX);
++	if (!path_sig) {
++		ret = RPMRC_FAIL;
++		goto out;
++	}
++
++	if (parser)
++		snprintf(path_sig, PATH_MAX,
++			 "%s.sig/0-parser_list-compact-libexec.sig",
++			 DIGEST_LIST_DEFAULT_PATH);
++	else
++		snprintf(path_sig, PATH_MAX,
++			"%s.sig/0-metadata_list-compact-%s-%s-%s.%s.sig",
++			 DIGEST_LIST_DEFAULT_PATH, rpmteN(te), rpmteV(te),
++			 rpmteR(te), rpmteA(te));
++
++	if (!stat(path_sig, &st))
++		digest_list_signed = 1;
++
++	if (parser && !digest_list_signed)
++		goto out;
++
++	if (parser)
++		snprintf(path, PATH_MAX, "%s/0-parser_list-compact-libexec",
++			 DIGEST_LIST_DEFAULT_PATH);
++	else
++		snprintf(path, PATH_MAX,
++			 "%s/0-metadata_list-compact-%s-%s-%s.%s",
++			 DIGEST_LIST_DEFAULT_PATH, rpmteN(te), rpmteV(te),
++			 rpmteR(te), rpmteA(te));
++
++	if (stat(path, &st) == -1)
++		goto out;
++
++	if (!parser && !digest_list_signed)
++		snprintf(path, PATH_MAX, "%s/0-metadata_list-rpm-%s-%s-%s.%s",
++			 DIGEST_LIST_DEFAULT_PATH, rpmteN(te), rpmteV(te),
++			 rpmteR(te), rpmteA(te));
++
++	size = lgetxattr(path, XATTR_NAME_IMA, NULL, 0);
++
++	/* Don't upload again if digest list was already processed */
++	if ((rpmteType(te) == TR_ADDED && size > 0) ||
++	    (rpmteType(te) == TR_REMOVED && size < 0)) {
++		rpmlog(RPMLOG_DEBUG, "digest_list: '%s' already processed, "
++		       "nothing to do\n", path);
++		goto out;
++	}
++
++	if (rpmteType(te) == TR_ADDED) {
++		if (!digest_list_signed) {
++			/* Write RPM header to the disk */
++			ret = write_rpm_digest_list(te, path);
++			if (ret < 0) {
++				ret = RPMRC_FAIL;
++				goto out;
++			}
++
++			/* Write RPM header sig to security.ima */
++			ret = write_rpm_digest_list_ima_xattr(te, path);
++		} else {
++			ret = write_digest_list_ima_xattr(te, path, path_sig);
++		}
++
++		if (ret < 0) {
++			ret = RPMRC_FAIL;
++			goto out;
++		}
++	}
++
++	/* Upload digest list to securityfs */
++	upload_digest_list(path, rpmteType(te), digest_list_signed);
++
++	if (rpmteType(te) == TR_REMOVED) {
++		if (!digest_list_signed) {
++			unlink(path);
++			goto out;
++		}
++
++		ret = lremovexattr(path, XATTR_NAME_IMA);
++		if (ret < 0)
++			rpmlog(RPMLOG_ERR, "digest_list: cannot remove "
++			       "security.ima from '%s'\n", path);
++		else
++			rpmlog(RPMLOG_DEBUG, "digest_list: security.ima "
++			       "successfully removed from '%s'\n", path);
++	}
++out:
++	free(path);
++	free(path_sig);
++	return ret;
++}
++
++static rpmRC digest_list_psm_pre(rpmPlugin plugin, rpmte te)
++{
++	process_digest_list(te, 0);
++	if (!strcmp(rpmteN(te), "digest-list-tools"))
++		process_digest_list(te, 1);
++
++	return RPMRC_OK;
++}
++
++static rpmRC digest_list_psm_post(rpmPlugin plugin, rpmte te, int res)
++{
++	if (res != RPMRC_OK)
++		return RPMRC_OK;
++
++	process_digest_list(te, 0);
++	if (!strcmp(rpmteN(te), "digest-list-tools"))
++		process_digest_list(te, 1);
++
++	return RPMRC_OK;
++}
++
++struct rpmPluginHooks_s digest_list_hooks = {
++	.psm_pre = digest_list_psm_pre,
++	.psm_post = digest_list_psm_post,
++};
+diff --git a/rpmio/digest.h b/rpmio/digest.h
+index 9e0cde3b9..01ca10d92 100644
+--- a/rpmio/digest.h
++++ b/rpmio/digest.h
+@@ -24,6 +24,7 @@ struct pgpDigAlg_s {
+ struct pgpDigParams_s {
+     char * userid;
+     uint8_t * hash;
++    const uint8_t * data;
+     uint8_t tag;
+ 
+     uint8_t version;		/*!< version number. */
+diff --git a/rpmio/rpmpgp.c b/rpmio/rpmpgp.c
+index 46cd0f31a..3c6b18b53 100644
+--- a/rpmio/rpmpgp.c
++++ b/rpmio/rpmpgp.c
+@@ -600,6 +600,7 @@ static int pgpPrtSig(pgpTag tag, const uint8_t *h, size_t hlen,
+ 	}
+ 
+ 	p = ((uint8_t *)v) + sizeof(*v);
++	_digp->data = p;
+ 	rc = pgpPrtSigParams(tag, v->pubkey_algo, v->sigtype, p, h, hlen, _digp);
+     }	break;
+     case 4:
+@@ -658,6 +659,7 @@ static int pgpPrtSig(pgpTag tag, const uint8_t *h, size_t hlen,
+ 	if (p > (h + hlen))
+ 	    return 1;
+ 
++	_digp->data = p;
+ 	rc = pgpPrtSigParams(tag, v->pubkey_algo, v->sigtype, p, h, hlen, _digp);
+     }	break;
+     default:
+@@ -745,6 +747,7 @@ static int pgpPrtKey(pgpTag tag, const uint8_t *h, size_t hlen,
+ 	    }
+ 
+ 	    p = ((uint8_t *)v) + sizeof(*v);
++	    _digp->data = p;
+ 	    rc = pgpPrtPubkeyParams(v->pubkey_algo, p, h, hlen, _digp);
+ 	}
+     }	break;
+-- 
+2.27.GIT
+

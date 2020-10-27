@@ -1,0 +1,57 @@
+From e07cef55252fddf45ff39e264097c04a726d0d79 Mon Sep 17 00:00:00 2001
+From: Roberto Sassu <roberto.sassu@huawei.com>
+Date: Fri, 7 Aug 2020 09:32:27 +0200
+Subject: [PATCH] Use user.digest_list to avoid duplicate processing of the
+ digest lists
+
+---
+ plugins/digest_list.c | 16 ++++++++++++----
+ 1 file changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/plugins/digest_list.c b/plugins/digest_list.c
+index beb397309..9fcb5c4c5 100644
+--- a/plugins/digest_list.c
++++ b/plugins/digest_list.c
+@@ -417,7 +417,7 @@ static int process_digest_list(rpmte te, int parser)
+ 			 DIGEST_LIST_DEFAULT_PATH, rpmteN(te), rpmteV(te),
+ 			 rpmteR(te), rpmteA(te));
+ 
+-	size = lgetxattr(path, XATTR_NAME_IMA, NULL, 0);
++	size = lgetxattr(path, "user.digest_list", NULL, 0);
+ 
+ 	/* Don't upload again if digest list was already processed */
+ 	if ((rpmteType(te) == TR_ADDED && size > 0) ||
+@@ -446,6 +446,14 @@ static int process_digest_list(rpmte te, int parser)
+ 			ret = RPMRC_FAIL;
+ 			goto out;
+ 		}
++
++		ret = lsetxattr(path, "user.digest_list", "1", 1, 0);
++		if (ret < 0)
++			rpmlog(RPMLOG_ERR, "digest_list: cannot add "
++			       "user.digest_list to '%s'\n", path);
++		else
++			rpmlog(RPMLOG_DEBUG, "digest_list: user.digest_list "
++			       "successfully added to '%s'\n", path);
+ 	}
+ 
+ 	/* Upload digest list to securityfs */
+@@ -457,12 +465,12 @@ static int process_digest_list(rpmte te, int parser)
+ 			goto out;
+ 		}
+ 
+-		ret = lremovexattr(path, XATTR_NAME_IMA);
++		ret = lremovexattr(path, "user.digest_list");
+ 		if (ret < 0)
+ 			rpmlog(RPMLOG_ERR, "digest_list: cannot remove "
+-			       "security.ima from '%s'\n", path);
++			       "user.digest_list from '%s'\n", path);
+ 		else
+-			rpmlog(RPMLOG_DEBUG, "digest_list: security.ima "
++			rpmlog(RPMLOG_DEBUG, "digest_list: user.digest_list "
+ 			       "successfully removed from '%s'\n", path);
+ 	}
+ out:
+-- 
+2.27.GIT
+
