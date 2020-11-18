@@ -1,4 +1,4 @@
-# IMA 贡献准则
+# openEuler IMA 贡献准则
 
 首先，感谢您考虑在 openEuler 上为 IMA 做贡献。正是像你这样的人使 IMA 成为 openEuler 系统完整性的的安全基石。
 

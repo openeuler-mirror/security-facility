@@ -1,4 +1,4 @@
-# CONTRIBUTING TO IMA
+# Contributing to IMA on openEuler
 
 First off, thank you for considering contributing to IMA on openEuler. It's people like you that make IMA the foundation of openEuler integrity.
 
