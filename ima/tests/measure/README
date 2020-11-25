@@ -1,0 +1,33 @@
+Introduction:
+  
+====================================================================================================================
+This is the testcases for IMA measure with IMA Digest List Extension.
+====================================================================================================================
+To run the testcases, please follow these steps:
+
+1) config kernel commandline to boot into IMA appraise log mode:
+ima_appraise=log evm=ignore ima_appraise_digest_list=digest ima_digest_list_pcr=+11 ima_template=ima-sig ima_policy="exec_tcb|appraise_exec_tcb|appraise_exec_immutable" initramtmpfs integrity=1
+
+2) make sure digest-list-tools and ima-evm-utils are installed:
+$ rpm -qa | grep digest-list-tools
+$ rpm -qa | grep ima-evm-utils
+
+3) add xattrs for installed protected files in the system:
+$ upload_digest_lists -p add-ima-xattr -d /etc/ima/digest_lists.tlv
+$ upload_digest_lists -p add-evm-xattr -d /etc/ima/digest_lists.tlv
+
+4) add xattrs for digest list files and check if they are correctly labelled:
+$ upload_digest_lists -p repair-meta-digest-lists
+$ find /etc/ima/digest_lists -type f -exec evmctl verify -o -a sha256 \{} \;
+
+5) config /etc/dracut.conf and add:
+install_items+=" /etc/keys/x509_ima.der /etc/keys/x509_evm.der"
+
+6) use dracut to generate initramfs with digest lists:
+$ dracut -f -e xattr
+
+7) config kernel commandline to boot into IMA measurement:
+ima_policy=exec_tcb ima_digest_list_pcr=11 integrity=1 evm=ignore
+
+8) run the tests:
+$ ./runltp -f ima
