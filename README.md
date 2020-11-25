@@ -2,11 +2,10 @@
 
 ## 介绍
 
-sig-security_facility主要讨论在openEuler社区版本中已有或未来规划的安全技术：
+sig-security_facility 主要讨论在 openEuler 社区版本中**已有**或**未来规划**的安全技术：
 
-在openEuler社区版本中使能主流的Linux安全特性，提供系统安全工具、库、基础设施等，提升系统的安全性
-
-改善现有安全技术的应用体验，帮助安全创造实际的价值
+* 在openEuler社区版本中使能主流的Linux安全特性，提供系统安全工具、库、基础设施等，提升系统的安全性。
+* 改善现有安全技术的应用体验，帮助安全创造实际的价值。
 
 ## 组织会议
 
@@ -14,7 +13,7 @@ sig-security_facility主要讨论在openEuler社区版本中已有或未来规�
 
 ## 成员
 
-### Maintainer列表
+### Maintainer 列表
 
 - zhujianwei001
 
@@ -22,7 +21,7 @@ sig-security_facility主要讨论在openEuler社区版本中已有或未来规�
 
 - robertosassu
 
-### Committer列表
+### Committer 列表
 
 - huangzq6
 
