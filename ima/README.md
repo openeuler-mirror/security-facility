@@ -67,8 +67,26 @@ $ cat /sys/kernel/security/ima/policy
 
 ## 参与贡献
 
-请参考 `ima/docs` 目录下的贡献准则文档。
+请参考 `ima/docs` 目录下的[贡献准则](https://gitee.com/nettingsisyphus/security-facility/blob/master/ima/docs/zh/%E8%B4%A1%E7%8C%AE%E5%87%86%E5%88%99.md)。
+
+## 开发计划
+
+| **需求描述**                                     | **交付版本** | **交付时间** | 进度                      |
+| ------------------------------------------------ | ------------ | ------------ | ------------------------- |
+| 内核态支持 IMA 摘要列表特性                      | 20.09        | 2020 年 9 月 | 已完成 :heavy_check_mark: |
+| OBS 支持摘要列表构建                             | 20.09        | 2020 年 9 月 | 已完成 :heavy_check_mark: |
+| 用户态支持自动标记扩展属性和导入摘要列表         | 20.09        | 2020 年 9 月 | 已完成 :heavy_check_mark: |
+| **5.10 内核适配支持 IMA 摘要列表，实现完整 CIV** | 21.03        | 2021 年 3 月 | 开发中 :horse_racing:     |
+| 新增 grub 接口，支持 IMA 开箱即用                | 21.03        | 2021 年 3 月 | 开发中 :horse_racing:     |
+| 落地 IMA 度量模式，对接远程证明                  | 21.03        | 2021 年 3 月 | 测试中 :eyes:             |
+| IMA Digest List 开源 LTP 用例补充                | 21.09        | 2021 年 9 月 | 未开始 :turtle:           |
+| 支持第三方构建 IMA 摘要列表                      | 21.09        | 2021 年 9 月 | 开发中 :horse_racing:     |
+| **容器场景实现对 IMA 校验的支持**                | 21.09        | 2021 年 9 月 | 未开始 :turtle:           |
+| bugfix：修复 KEXEC_KERNEL_CHECK 问题             | 21.03        | 2021 年 3 月 | 开发中 :horse_racing:     |
+
+更多信息请参考[开发计划](https://gitee.com/nettingsisyphus/security-facility/blob/master/ima/docs/zh/%E5%BC%80%E5%8F%91%E8%AE%A1%E5%88%92.md)。
 
 ## 参考资料
+
 * [管理员指南可信计算章节](https://openeuler.org/zh/docs/20.09/docs/Administration/%E5%8F%AF%E4%BF%A1%E8%AE%A1%E7%AE%97.html)
 * [openEuler 直播视频](https://www.bilibili.com/video/BV1dk4y1171e?from=search&seid=4389855788715605912)
