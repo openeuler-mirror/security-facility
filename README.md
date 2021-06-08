@@ -21,6 +21,8 @@ sig-security_facility 主要讨论在 openEuler 社区版本中**已有**或**�
 
 - robertosassu
 
+- gwei3
+
 ### Committer 列表
 
 - huangzq6
@@ -39,8 +41,6 @@ sig-security_facility 主要讨论在 openEuler 社区版本中**已有**或**�
 
 - flysubmarine
 
-- gwei3
-
 - wucaijun2001
 
 ## 联系方式
@@ -53,6 +53,7 @@ sig-security_facility 主要讨论在 openEuler 社区版本中**已有**或**�
 * openeuler/attest-tools
 * openeuler/digest-list-tools
 * openeuler/security-tool
+* openeuler/kunpengsecl
 
 软件包仓：
 
