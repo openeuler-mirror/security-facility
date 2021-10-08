@@ -1,0 +1,482 @@
+From c278f92dfbcd1edb9474b367e51232d523cfdf3e Mon Sep 17 00:00:00 2001
+From: Krzysztof Struczynski <krzysztof.struczynski@huawei.com>
+Date: Fri, 17 Jul 2020 08:29:37 +0200
+Subject: [PATCH] ima: Add IMA namespace to the container
+
+Add IMA namespace to the supported Linux namespaces
+Add new runc input parameters to:
+- enable IMA
+- set path to the policy file
+- set path to the x509 cert
+- set kernel command line parameters
+
+Signed-off-by: Krzysztof Struczynski <krzysztof.struczynski@huawei.com>
+---
+ libcontainer/configs/namespaces_linux.go   |  4 +
+ libcontainer/configs/namespaces_syscall.go |  7 +-
+ libcontainer/container_linux.go            | 35 ++++++++-
+ libcontainer/factory_linux.go              | 41 ++++++++++
+ libcontainer/message_linux.go              | 26 +++++++
+ libcontainer/nsenter/namespace.h           |  3 +
+ libcontainer/nsenter/nsexec.c              | 87 +++++++++++++++++++++-
+ main.go                                    | 19 +++++
+ utils_linux.go                             |  6 +-
+ 9 files changed, 216 insertions(+), 12 deletions(-)
+
+diff --git a/libcontainer/configs/namespaces_linux.go b/libcontainer/configs/namespaces_linux.go
+index 1bbaef9b..2da814f4 100644
+--- a/libcontainer/configs/namespaces_linux.go
++++ b/libcontainer/configs/namespaces_linux.go
+@@ -14,6 +14,7 @@ const (
+ 	NEWIPC    NamespaceType = "NEWIPC"
+ 	NEWUSER   NamespaceType = "NEWUSER"
+ 	NEWCGROUP NamespaceType = "NEWCGROUP"
++	NEWIMA    NamespaceType = "NEWIMA"
+ )
+ 
+ var (
+@@ -38,6 +39,8 @@ func NsName(ns NamespaceType) string {
+ 		return "uts"
+ 	case NEWCGROUP:
+ 		return "cgroup"
++	case NEWIMA:
++		return "ima"
+ 	}
+ 	return ""
+ }
+@@ -72,6 +75,7 @@ func NamespaceTypes() []NamespaceType {
+ 		NEWPID,
+ 		NEWNS,
+ 		NEWCGROUP,
++		NEWIMA,
+ 	}
+ }
+ 
+diff --git a/libcontainer/configs/namespaces_syscall.go b/libcontainer/configs/namespaces_syscall.go
+index 2dc7adfc..0ef975b5 100644
+--- a/libcontainer/configs/namespaces_syscall.go
++++ b/libcontainer/configs/namespaces_syscall.go
+@@ -4,11 +4,11 @@ package configs
+ 
+ import "golang.org/x/sys/unix"
+ 
+-func (n *Namespace) Syscall() int {
++func (n *Namespace) Syscall() int64 {
+ 	return namespaceInfo[n.Type]
+ }
+ 
+-var namespaceInfo = map[NamespaceType]int{
++var namespaceInfo = map[NamespaceType]int64{
+ 	NEWNET:    unix.CLONE_NEWNET,
+ 	NEWNS:     unix.CLONE_NEWNS,
+ 	NEWUSER:   unix.CLONE_NEWUSER,
+@@ -16,12 +16,13 @@ var namespaceInfo = map[NamespaceType]int{
+ 	NEWUTS:    unix.CLONE_NEWUTS,
+ 	NEWPID:    unix.CLONE_NEWPID,
+ 	NEWCGROUP: unix.CLONE_NEWCGROUP,
++	NEWIMA:    0x400000000,
+ }
+ 
+ // CloneFlags parses the container's Namespaces options to set the correct
+ // flags on clone, unshare. This function returns flags only for new namespaces.
+ func (n *Namespaces) CloneFlags() uintptr {
+-	var flag int
++	var flag int64
+ 	for _, v := range *n {
+ 		if v.Path != "" {
+ 			continue
+diff --git a/libcontainer/container_linux.go b/libcontainer/container_linux.go
+index c5188b1d..b6c81fb8 100644
+--- a/libcontainer/container_linux.go
++++ b/libcontainer/container_linux.go
+@@ -54,6 +54,10 @@ type linuxContainer struct {
+ 	criuVersion          int
+ 	state                containerState
+ 	created              time.Time
++	imaNs                bool
++	imaX509Path          string
++	imaPolicyPath        string
++	imaKcmd              string
+ }
+ 
+ // State represents a running container's state
+@@ -1877,9 +1881,8 @@ func (c *linuxContainer) currentOCIState() (*specs.State, error) {
+ func (c *linuxContainer) orderNamespacePaths(namespaces map[configs.NamespaceType]string) ([]string, error) {
+ 	paths := []string{}
+ 	for _, ns := range configs.NamespaceTypes() {
+-
+ 		// Remove namespaces that we don't need to join.
+-		if !c.config.Namespaces.Contains(ns) {
++		if !c.config.Namespaces.Contains(ns) && ns != "NEWIMA" {
+ 			continue
+ 		}
+ 
+@@ -1926,10 +1929,15 @@ func (c *linuxContainer) bootstrapData(cloneFlags uintptr, nsMaps map[configs.Na
+ 	// create the netlink message
+ 	r := nl.NewNetlinkRequest(int(InitMsg), 0)
+ 
++    cloneFlagsU64 := uint64(cloneFlags)
++    if c.imaNs && cloneFlagsU64 != 0 {
++        cloneFlagsU64 |= 0x400000000
++    }
++
+ 	// write cloneFlags
+-	r.AddData(&Int32msg{
++	r.AddData(&Int64msg{
+ 		Type:  CloneFlagsAttr,
+-		Value: uint32(cloneFlags),
++		Value: cloneFlagsU64,
+ 	})
+ 
+ 	// write custom namespace paths
+@@ -2004,6 +2012,25 @@ func (c *linuxContainer) bootstrapData(cloneFlags uintptr, nsMaps map[configs.Na
+ 		Value: c.config.RootlessEUID,
+ 	})
+ 
++    if c.imaX509Path != "" {
++        r.AddData(&Bytemsg{
++            Type:  ImaX509PathAttr,
++            Value: []byte(c.imaX509Path),
++        })
++    }
++    if c.imaPolicyPath != "" {
++        r.AddData(&Bytemsg{
++            Type:  ImaPolicyPathAttr,
++            Value: []byte(c.imaPolicyPath),
++        })
++    }
++    if c.imaKcmd != "" {
++        r.AddData(&Bytemsg{
++            Type:  ImaKcmdAttr,
++            Value: []byte(c.imaKcmd),
++        })
++    }
++
+ 	return bytes.NewReader(r.Serialize()), nil
+ }
+ 
+diff --git a/libcontainer/factory_linux.go b/libcontainer/factory_linux.go
+index 59548ef8..8477c0c1 100644
+--- a/libcontainer/factory_linux.go
++++ b/libcontainer/factory_linux.go
+@@ -238,6 +238,11 @@ type LinuxFactory struct {
+ 
+ 	// NewIntelRdtManager returns an initialized Intel RDT manager for a single container.
+ 	NewIntelRdtManager func(config *configs.Config, id string, path string) intelrdt.Manager
++
++    ImaNs bool
++	ImaX509Path string
++	ImaPolicyPath string
++	ImaKcmd string
+ }
+ 
+ func (l *LinuxFactory) Create(id string, config *configs.Config) (Container, error) {
+@@ -275,6 +280,10 @@ func (l *LinuxFactory) Create(id string, config *configs.Config) (Container, err
+ 		newuidmapPath: l.NewuidmapPath,
+ 		newgidmapPath: l.NewgidmapPath,
+ 		cgroupManager: l.NewCgroupsManager(config.Cgroups, nil),
++		imaNs:         l.ImaNs,
++		imaX509Path:   l.ImaX509Path,
++		imaPolicyPath: l.ImaPolicyPath,
++		imaKcmd:       l.ImaKcmd,
+ 	}
+ 	if intelrdt.IsCatEnabled() || intelrdt.IsMbaEnabled() {
+ 		c.intelRdtManager = l.NewIntelRdtManager(config, id, "")
+@@ -317,6 +326,10 @@ func (l *LinuxFactory) Load(id string) (Container, error) {
+ 		cgroupManager:        l.NewCgroupsManager(state.Config.Cgroups, state.CgroupPaths),
+ 		root:                 containerRoot,
+ 		created:              state.Created,
++		imaNs:                l.ImaNs,
++		imaX509Path:          l.ImaX509Path,
++		imaPolicyPath:        l.ImaPolicyPath,
++		imaKcmd:              l.ImaKcmd,
+ 	}
+ 	c.state = &loadedState{c: c}
+ 	if err := c.refreshState(); err != nil {
+@@ -448,3 +461,31 @@ func NewgidmapPath(newgidmapPath string) func(*LinuxFactory) error {
+ 		return nil
+ 	}
+ }
++
++func ImaNs(imaNs bool) func(*LinuxFactory) error {
++	return func(l *LinuxFactory) error {
++		l.ImaNs = imaNs
++		return nil
++	}
++}
++
++func ImaX509Path(imaX509Path string) func(*LinuxFactory) error {
++	return func(l *LinuxFactory) error {
++		l.ImaX509Path = imaX509Path
++		return nil
++	}
++}
++
++func ImaPolicyPath(imaPolicyPath string) func(*LinuxFactory) error {
++	return func(l *LinuxFactory) error {
++		l.ImaPolicyPath = imaPolicyPath
++		return nil
++	}
++}
++
++func ImaKcmd(imaKcmd string) func(*LinuxFactory) error {
++	return func(l *LinuxFactory) error {
++		l.ImaKcmd = imaKcmd
++		return nil
++	}
++}
+diff --git a/libcontainer/message_linux.go b/libcontainer/message_linux.go
+index 1d4f5033..11006bdd 100644
+--- a/libcontainer/message_linux.go
++++ b/libcontainer/message_linux.go
+@@ -20,6 +20,10 @@ const (
+ 	RootlessEUIDAttr uint16 = 27287
+ 	UidmapPathAttr   uint16 = 27288
+ 	GidmapPathAttr   uint16 = 27289
++	ImaNsAttr         uint16 = 27290
++	ImaX509PathAttr   uint16 = 27291
++	ImaPolicyPathAttr uint16 = 27292
++	ImaKcmdAttr       uint16 = 27293
+ )
+ 
+ type Int32msg struct {
+@@ -44,6 +48,28 @@ func (msg *Int32msg) Len() int {
+ 	return unix.NLA_HDRLEN + 4
+ }
+ 
++type Int64msg struct {
++	Type  uint16
++	Value uint64
++}
++
++// Serialize serializes the message.
++// Int64msg has the following representation
++// | nlattr len | nlattr type |
++// | uint64 value             |
++func (msg *Int64msg) Serialize() []byte {
++	buf := make([]byte, msg.Len())
++	native := nl.NativeEndian()
++	native.PutUint16(buf[0:2], uint16(msg.Len()))
++	native.PutUint16(buf[2:4], msg.Type)
++	native.PutUint64(buf[4:12], msg.Value)
++	return buf
++}
++
++func (msg *Int64msg) Len() int {
++	return unix.NLA_HDRLEN + 8
++}
++
+ // Bytemsg has the following representation
+ // | nlattr len | nlattr type |
+ // | value              | pad |
+diff --git a/libcontainer/nsenter/namespace.h b/libcontainer/nsenter/namespace.h
+index 9e9bdca0..08aa4d22 100644
+--- a/libcontainer/nsenter/namespace.h
++++ b/libcontainer/nsenter/namespace.h
+@@ -28,5 +28,8 @@
+ #ifndef CLONE_NEWNET
+ #	define CLONE_NEWNET 0x40000000 /* New network namespace */
+ #endif
++#ifndef CLONE_NEWIMA
++#	define CLONE_NEWIMA 0x400000000ULL /* New ima namespace */
++#endif
+ 
+ #endif /* NSENTER_NAMESPACE_H */
+diff --git a/libcontainer/nsenter/nsexec.c b/libcontainer/nsenter/nsexec.c
+index a33f2fcc..39e0e62e 100644
+--- a/libcontainer/nsenter/nsexec.c
++++ b/libcontainer/nsenter/nsexec.c
+@@ -68,7 +68,7 @@ struct nlconfig_t {
+ 	char *data;
+ 
+ 	/* Process settings. */
+-	uint32_t cloneflags;
++	uint64_t cloneflags;
+ 	char *oom_score_adj;
+ 	size_t oom_score_adj_len;
+ 
+@@ -87,6 +87,14 @@ struct nlconfig_t {
+ 	size_t uidmappath_len;
+ 	char *gidmappath;
+ 	size_t gidmappath_len;
++
++    uint8_t ima_ns;
++    char *ima_x509_path;
++    size_t ima_x509_path_len;
++    char *ima_policy_path;
++    size_t ima_policy_path_len;
++    char *ima_k_cmd;
++    size_t ima_k_cmd_len;
+ };
+ 
+ #define PANIC   "panic"
+@@ -113,6 +121,11 @@ static int logfd = -1;
+ #define UIDMAPPATH_ATTR	    27288
+ #define GIDMAPPATH_ATTR	    27289
+ 
++#define IMA_NS_ATTR          27290
++#define IMA_X509_PATH_ATTR   27291
++#define IMA_POLICY_PATH_ATTR 27292
++#define IMA_K_CMD_ATTR       27293
++
+ /*
+  * Use the raw syscall for versions of glibc which don't include a function for
+  * it, namely (glibc 2.12).
+@@ -406,9 +419,9 @@ static int nsflag(char *name)
+ 	return 0;
+ }
+ 
+-static uint32_t readint32(char *buf)
++static uint64_t readint64(char *buf)
+ {
+-	return *(uint32_t *) buf;
++	return *(uint64_t *) buf;
+ }
+ 
+ static uint8_t readint8(char *buf)
+@@ -455,7 +468,7 @@ static void nl_parse(int fd, struct nlconfig_t *config)
+ 		/* Handle payload. */
+ 		switch (nlattr->nla_type) {
+ 		case CLONE_FLAGS_ATTR:
+-			config->cloneflags = readint32(current);
++			config->cloneflags = readint64(current);
+ 			break;
+ 		case ROOTLESS_EUID_ATTR:
+ 			config->is_rootless_euid = readint8(current);	/* boolean */
+@@ -487,6 +500,21 @@ static void nl_parse(int fd, struct nlconfig_t *config)
+ 		case SETGROUP_ATTR:
+ 			config->is_setgroup = readint8(current);
+ 			break;
++		case IMA_NS_ATTR:
++			config->ima_ns = readint8(current);	/* boolean */
++			break;
++		case IMA_X509_PATH_ATTR:
++			config->ima_x509_path = current;
++			config->ima_x509_path_len = payload_len;
++			break;
++		case IMA_POLICY_PATH_ATTR:
++			config->ima_policy_path = current;
++			config->ima_policy_path_len = payload_len;
++			break;
++		case IMA_K_CMD_ATTR:
++			config->ima_k_cmd = current;
++			config->ima_k_cmd_len = payload_len;
++			break;
+ 		default:
+ 			bail("unknown netlink message type %d", nlattr->nla_type);
+ 		}
+@@ -495,6 +523,35 @@ static void nl_parse(int fd, struct nlconfig_t *config)
+ 	}
+ }
+ 
++#include <sys/syscall.h>
++#include <sys/sysmacros.h>
++
++#ifndef CLONE_NEWIMA
++#define CLONE_NEWIMA    0x400000000ULL
++#endif
++
++static pid_t sys_unshare(unsigned long unshare_flags)
++{
++        return syscall(__NR_unshare, unshare_flags, sizeof(unshare_flags));
++}
++
++enum ima_data_type {
++	IMA_DATA_POLICY_PATH,
++	IMA_DATA_X509_PATH,
++	IMA_DATA_KCMD,
++};
++
++static int write_ima(const char *data, size_t data_len,
++        enum ima_data_type data_type) {
++   static const char *paths[] = {
++	   [IMA_DATA_POLICY_PATH] = "/sys/kernel/security/ima/policy_for_children",
++	   [IMA_DATA_X509_PATH] = "/sys/kernel/security/ima/x509_for_children",
++	   [IMA_DATA_KCMD] = "/sys/kernel/security/ima/kcmd_for_children",
++   };
++
++   return write_file((char *)data, data_len, (char *)paths[data_type]);
++}
++
+ void nl_free(struct nlconfig_t *config)
+ {
+ 	free(config->data);
+@@ -899,6 +956,28 @@ void nsexec(void)
+ 				if (setresuid(0, 0, 0) < 0)
+ 					bail("failed to become root in user namespace");
+ 			}
++
++			if (config.cloneflags & CLONE_NEWIMA) {
++                /* IMA: Unshare IMA namespace */
++                if (sys_unshare(CLONE_NEWIMA) < 0)
++                    bail("ima: failed to unshare IMA namespace");
++
++                /* IMA: x509 path */
++                if (config.ima_x509_path &&
++                        write_ima(config.ima_x509_path, config.ima_x509_path_len, IMA_DATA_X509_PATH) < 0)
++                    bail("ima: failed to write x509 path");
++
++                /* IMA: policy file path */
++                if (config.ima_policy_path &&
++                        write_ima(config.ima_policy_path, config.ima_policy_path_len, IMA_DATA_POLICY_PATH) < 0)
++                    bail("ima: failed to write x509 path");
++
++                /* IMA: kcmd */
++                if (config.ima_k_cmd &&
++                        write_ima(config.ima_k_cmd, config.ima_k_cmd_len, IMA_DATA_KCMD) < 0)
++                    bail("ima: failed to write kcmd");
++            }
++
+ 			/*
+ 			 * Unshare all of the namespaces. Now, it should be noted that this
+ 			 * ordering might break in the future (especially with rootless
+diff --git a/main.go b/main.go
+index fd1ad5ff..a1c05c9f 100644
+--- a/main.go
++++ b/main.go
+@@ -107,6 +107,25 @@ func main() {
+ 			Value: "auto",
+ 			Usage: "ignore cgroup permission errors ('true', 'false', or 'auto')",
+ 		},
++		cli.BoolFlag{
++			Name:  "imans",
++			Usage: "create a new IMA namespace",
++		},
++		cli.StringFlag{
++			Name:  "ima-x509",
++			Value: "",
++			Usage: "path to the x509 certificate for the new ima namespace",
++		},
++		cli.StringFlag{
++			Name:  "ima-policy",
++			Value: "",
++			Usage: "path to the policy file for the new ima namespace",
++		},
++		cli.StringFlag{
++			Name:  "ima-kcmd",
++			Value: "",
++			Usage: "boot parameters for the new ima namespace",
++		},
+ 	}
+ 	app.Commands = []cli.Command{
+ 		checkpointCommand,
+diff --git a/utils_linux.go b/utils_linux.go
+index a9587f7d..b804a47b 100644
+--- a/utils_linux.go
++++ b/utils_linux.go
+@@ -77,7 +77,11 @@ func loadFactory(context *cli.Context) (libcontainer.Factory, error) {
+ 	return libcontainer.New(abs, cgroupManager, intelRdtManager,
+ 		libcontainer.CriuPath(context.GlobalString("criu")),
+ 		libcontainer.NewuidmapPath(newuidmap),
+-		libcontainer.NewgidmapPath(newgidmap))
++		libcontainer.NewgidmapPath(newgidmap),
++		libcontainer.ImaNs(context.GlobalBool("imans")),
++		libcontainer.ImaX509Path(context.GlobalString("ima-x509")),
++		libcontainer.ImaPolicyPath(context.GlobalString("ima-policy")),
++		libcontainer.ImaKcmd(context.GlobalString("ima-kcmd")))
+ }
+ 
+ // getContainer returns the specified container instance by loading it from state
+-- 
+2.17.1
+
